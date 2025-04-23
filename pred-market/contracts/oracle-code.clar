@@ -1,5 +1,5 @@
-;; Decentralized Prediction Market Protocol - Version 2
-;; Enhanced with prediction power, liquidity pool, and token transfers
+;; Decentralized Prediction Market Protocol - Version 3
+;; Complete implementation with consensus threshold and reward distribution
 
 ;; Constants
 (define-constant ERR-NOT-ORACLE (err u1))
@@ -19,6 +19,7 @@
 (define-data-var prediction-round uint u0)
 (define-data-var entry-fee uint u1000000) ;; 1 prediction token minimum
 (define-data-var liquidity-pool uint u0)
+(define-data-var consensus-threshold uint u33) ;; 33% consensus required for prediction to win
 
 ;; Event Structure
 (define-map events
@@ -30,6 +31,7 @@
         reward-pool: uint,         ;; Amount of tokens allocated for winners
         predictions-true: uint,
         predictions-false: uint,
+        total-possible-predictions: uint,  ;; Total circulating tokens at event creation
         resolved: bool,
         outcome: bool
     }
@@ -54,6 +56,15 @@
     }
 )
 
+;; Reward Distribution Records
+(define-map reward-distributions
+    {event-id: uint, predictor: principal}
+    {
+        amount: uint,
+        claimed: bool
+    }
+)
+
 ;; Authorization
 (define-private (is-oracle)
     (is-eq tx-sender (var-get market-oracle)))
@@ -75,6 +86,7 @@
     (reward-pool uint))
     (let (
         (predictor-profile (unwrap! (map-get? predictor-profiles tx-sender) ERR-INSUFFICIENT-TOKENS))
+        (total-token-supply u10000000) ;; Example: 10M total tokens
         )
         
         ;; Check market status
@@ -102,6 +114,7 @@
                 reward-pool: reward-pool,
                 predictions-true: u0,
                 predictions-false: u0,
+                total-possible-predictions: total-token-supply,
                 resolved: false,
                 outcome: false
             })
@@ -191,24 +204,68 @@
         ;; Check event hasn't been resolved
         (asserts! (not (get resolved event)) ERR-EVENT-RESOLVED)
         
-        ;; Update event status
-        (map-set events event-id
-            (merge event {
-                resolved: true,
-                outcome: outcome
-            }))
+        ;; Calculate if consensus was reached
+        (let (
+            (total-predictions (+ (get predictions-true event) (get predictions-false event)))
+            (consensus-threshold-value (/ (* (get total-possible-predictions event) (var-get consensus-threshold)) u100))
+            )
+            
+            ;; Update event status
+            (map-set events event-id
+                (merge event {
+                    resolved: true,
+                    outcome: outcome
+                }))
+            
+            ;; If event has a reward pool, prepare for distribution
+            (if (> (get reward-pool event) u0)
+                (begin
+                    ;; Ensure liquidity pool has enough balance
+                    (asserts! (>= (var-get liquidity-pool) (get reward-pool event)) ERR-INSUFFICIENT-TOKENS)
+                    
+                    ;; Update liquidity pool
+                    (var-set liquidity-pool (- (var-get liquidity-pool) (get reward-pool event)))
+                    
+                    (ok true))
+                (ok false)))))
+
+;; Reward Claiming
+(define-public (claim-reward (event-id uint))
+    (let (
+        (event (unwrap! (map-get? events event-id) ERR-INVALID-EVENT))
+        (prediction-record (unwrap! (map-get? prediction-records {event-id: event-id, predictor: tx-sender}) ERR-INVALID-EVENT))
+        )
         
-        ;; If event has a reward pool, distribute it
-        (if (> (get reward-pool event) u0)
-            (begin
-                ;; Ensure liquidity pool has enough balance
-                (asserts! (>= (var-get liquidity-pool) (get reward-pool event)) ERR-INSUFFICIENT-TOKENS)
+        ;; Check event has been resolved
+        (asserts! (get resolved event) ERR-INVALID-EVENT)
+        
+        ;; Check if predictor made the correct prediction
+        (asserts! (is-eq (get prediction prediction-record) (get outcome event)) ERR-INVALID-PARAMETER)
+        
+        ;; Check if reward hasn't been claimed yet
+        (let (
+            (existing-reward (map-get? reward-distributions {event-id: event-id, predictor: tx-sender}))
+            )
+            
+            (asserts! (or (is-none existing-reward) (not (get claimed (default-to {amount: u0, claimed: false} existing-reward)))) ERR-INVALID-PARAMETER)
+            
+            ;; Calculate reward share
+            (let (
+                (winning-predictions (if (get outcome event) (get predictions-true event) (get predictions-false event)))
+                (stake-amount (get stake-amount prediction-record))
+                (reward-share (/ (* (get reward-pool event) stake-amount) winning-predictions))
+                )
                 
-                ;; Update liquidity pool
-                (var-set liquidity-pool (- (var-get liquidity-pool) (get reward-pool event)))
+                ;; Record reward distribution
+                (map-set reward-distributions
+                    {event-id: event-id, predictor: tx-sender}
+                    {amount: reward-share, claimed: true}
+                )
                 
-                (ok true))
-            (ok false))))
+                ;; Transfer tokens to predictor
+                (try! (stx-transfer? reward-share (var-get market-oracle) tx-sender))
+                
+                (ok reward-share)))))
 
 ;; Read-only functions
 (define-read-only (get-event-details (event-id uint))
@@ -222,13 +279,28 @@
         active: (var-get market-active),
         prediction-round: (var-get prediction-round),
         liquidity-pool: (var-get liquidity-pool),
-        entry-fee: (var-get entry-fee)
+        entry-fee: (var-get entry-fee),
+        consensus-threshold: (var-get consensus-threshold)
     })
+
+(define-read-only (get-prediction-record (event-id uint) (predictor principal))
+    (map-get? prediction-records {event-id: event-id, predictor: predictor}))
+
+(define-read-only (get-reward-distribution (event-id uint) (predictor principal))
+    (map-get? reward-distributions {event-id: event-id, predictor: predictor}))
 
 (define-public (update-entry-fee (new-fee uint))
     (begin
         (asserts! (is-oracle) ERR-NOT-ORACLE)
         (var-set entry-fee new-fee)
+        (ok true)))
+
+(define-public (update-consensus-threshold (new-percentage uint))
+    (begin
+        (asserts! (is-oracle) ERR-NOT-ORACLE)
+        ;; Validate percentage is between 1 and 100
+        (asserts! (and (> new-percentage u0) (<= new-percentage u100)) ERR-INVALID-PARAMETER)
+        (var-set consensus-threshold new-percentage)
         (ok true)))
 
 (define-public (close-market)
@@ -249,3 +321,68 @@
         (asserts! (is-oracle) ERR-NOT-ORACLE)
         (var-set market-oracle new-oracle)
         (ok true)))
+
+(define-public (add-to-liquidity-pool (amount uint))
+    (begin
+        (asserts! (var-get market-active) ERR-MARKET-CLOSED)
+        (asserts! (> amount u0) ERR-INVALID-PARAMETER)
+        
+        ;; Transfer tokens to market liquidity pool
+        (try! (stx-transfer? amount tx-sender (var-get market-oracle)))
+        
+        ;; Update predictor profile if exists
+        (match (map-get? predictor-profiles tx-sender)
+            predictor-profile (map-set predictor-profiles tx-sender
+                (merge predictor-profile {
+                    token-balance: (+ (get token-balance predictor-profile) amount)
+                }))
+            ;; If no profile exists, create one
+            (map-set predictor-profiles tx-sender {
+                token-balance: amount,
+                events-created: (list),
+                prediction-power: amount
+            })
+        )
+        
+        ;; Update liquidity pool
+        (var-set liquidity-pool (+ (var-get liquidity-pool) amount))
+        
+        (ok true)))
+
+(define-public (withdraw-from-liquidity-pool (amount uint))
+    (begin
+        (asserts! (var-get market-active) ERR-MARKET-CLOSED)
+        (asserts! (is-oracle) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-PARAMETER)
+        
+        ;; Ensure liquidity pool has enough balance
+        (asserts! (>= (var-get liquidity-pool) amount) ERR-INSUFFICIENT-TOKENS)
+        
+        ;; Transfer tokens from market liquidity pool to recipient
+        (try! (stx-transfer? amount (var-get market-oracle) tx-sender))
+        
+        ;; Update liquidity pool
+        (var-set liquidity-pool (- (var-get liquidity-pool) amount))
+        
+        (ok true)))
+
+(define-read-only (get-prediction-count (event-id uint))
+    (let (
+        (event (unwrap-panic (map-get? events event-id)))
+        )
+        {
+            predictions-true: (get predictions-true event),
+            predictions-false: (get predictions-false event),
+            total: (+ (get predictions-true event) (get predictions-false event))
+        }))
+
+(define-read-only (check-prediction-eligibility (event-id uint))
+    (let (
+        (event (unwrap! (map-get? events event-id) false))
+        (user-predicted (is-some (map-get? prediction-records {event-id: event-id, predictor: tx-sender})))
+        )
+        (and
+            (var-get market-active)
+            (not (get resolved event))
+            (not user-predicted)
+        )))
